@@ -1,0 +1,400 @@
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * HemaMatch - Java BACKEND using OOP concepts (REST API, no libraries needed)
+ *
+ * Run:   javac HemaMatchServer.java
+ *        java HemaMatchServer
+ * Open:  http://localhost:8080     (serves index.html from the same folder)
+ *
+ * OOP CONCEPTS USED (search for the "OOP:" comments):
+ *   1. Class & Object ......... User, Unit, Request, Allocation, PickupRecord, BloodBank
+ *      LOGIN MODULE = main example of Class/Object + Inheritance (User -> AdminUser, HospitalUser, LabTechnicianUser)
+ *   2. Encapsulation .......... private fields + getters; objects change their own data (take(), advance())
+ *   3. Inheritance ............ Unit/Request/Allocation/PickupRecord extend BaseEntity; ApiException extends RuntimeException
+ *   4. Abstraction ............ interface JsonSerializable, abstract class BaseEntity; BloodBank hides all the logic
+ *   5. Polymorphism ........... toJson()/describe() overridden in each class; overloaded need(); List<? extends JsonSerializable>
+ *   6. Composition ............ Allocation HAS-A Request and Unit; BloodBank HAS lists of entities
+ *   7. Enums .................. Urgency, StockStatus, SafetyStatus, PickupStep (each carries its own behaviour)
+ */
+public class HemaMatchServer {
+
+    /* =====================================================================
+       ABSTRACTION - interface: only says WHAT a class must do
+       ===================================================================== */
+    interface JsonSerializable {
+        String toJson();
+    }
+
+    /* =====================================================================
+       ABSTRACTION + INHERITANCE - abstract parent of every stored object
+       ===================================================================== */
+    static abstract class BaseEntity implements JsonSerializable {
+        private final String id;                      // ENCAPSULATION: private
+
+        protected BaseEntity(String id) { this.id = id; }
+
+        public String getId() { return id; }
+
+        public abstract String describe();            // every child MUST write its own version
+
+        @Override public String toString() { return describe(); }
+    }
+
+    /* =====================================================================
+       ENUMS - a fixed list of values that also carry behaviour
+       ===================================================================== */
+    enum Urgency {
+        CRITICAL(95), HIGH(80), ROUTINE(50);
+        private final int priority;
+        Urgency(int p) { priority = p; }
+        int getPriority() { return priority; }
+    }
+
+    enum StockStatus { AVAILABLE, EXPIRING, EXPIRED }
+
+    enum RequestStatus { PENDING, ALLOCATED, COMPLETED }
+
+    enum SafetyStatus { PENDING, READY, LOCKED }
+
+    enum PickupStep {
+        ALLOCATED, VERIFIED, READY_PICKUP, PICKED_UP;
+        PickupStep next() { return values()[Math.min(ordinal() + 1, values().length - 1)]; }
+        boolean isLast() { return this == PICKED_UP; }
+    }
+
+    /* =====================================================================
+       Blood compatibility rules (one place, used by allocation + safety)
+       ===================================================================== */
+    static final class Compatibility {
+        private static final Map<String, List<String>> CAN_RECEIVE = Map.of(
+            "O+", List.of("O+", "O-"), "O-", List.of("O-"),
+            "A+", List.of("A+", "A-", "O+", "O-"), "A-", List.of("A-", "O-"),
+            "B+", List.of("B+", "B-", "O+", "O-"), "B-", List.of("B-", "O-"),
+            "AB+", List.of("A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"),
+            "AB-", List.of("A-", "B-", "O-", "AB-"));
+        private Compatibility() { }
+        static boolean canGive(String patientGroup, String unitGroup) {
+            return CAN_RECEIVE.get(patientGroup).contains(unitGroup);
+        }
+        static Set<String> groups() { return CAN_RECEIVE.keySet(); }
+    }
+
+    /* =====================================================================
+       CLASS & OBJECT + INHERITANCE : Unit  (one blood stock record)
+       ===================================================================== */
+    static class Unit extends BaseEntity {
+        private final String hospital, group, component;
+        private int qty;
+        private final LocalDate expiry;
+
+        Unit(String id, String hospital, String group, String component, int qty, LocalDate expiry) {
+            super(id);
+            this.hospital = hospital; this.group = group; this.component = component;
+            this.qty = qty; this.expiry = expiry;
+        }
+
+        public String getHospital()  { return hospital; }
+        public String getGroup()     { return group; }
+        public String getComponent() { return component; }
+        public int getQty()          { return qty; }
+        public LocalDate getExpiry() { return expiry; }
+
+        // ENCAPSULATION: the object guards its own quantity
+        public void take(int n) {
+            if (n > qty) throw new ApiException(409, "Not enough quantity in " + getId());
+            qty -= n;
+        }
+        public void giveBack(int n) { qty += n; }
+
+        public StockStatus status() {
+            long d = ChronoUnit.DAYS.between(LocalDate.now(), expiry);
+            return d < 0 ? StockStatus.EXPIRED : (d <= 2 ? StockStatus.EXPIRING : StockStatus.AVAILABLE);
+        }
+
+        @Override public String describe() {                       // POLYMORPHISM: overriding
+            return "Unit " + getId() + " " + group + " " + component + " x" + qty + " (" + hospital + ", exp " + expiry + ")";
+        }
+        @Override public String toJson() {
+            return "{\"unitId\":" + Json.q(getId()) + ",\"hospital\":" + Json.q(hospital) + ",\"group\":" + Json.q(group)
+                 + ",\"component\":" + Json.q(component) + ",\"qty\":" + qty + ",\"expiry\":" + Json.q(expiry.toString()) + "}";
+        }
+    }
+
+    /* =====================================================================
+       CLASS & OBJECT + INHERITANCE : Request  (one patient blood request)
+       ===================================================================== */
+    static class Request extends BaseEntity {
+        private final String hospital, name, group, component;
+        private final int qty;
+        private final Double hb;
+        private final Urgency urgency;
+        private final long createdAt = System.currentTimeMillis();
+        private RequestStatus status = RequestStatus.PENDING;
+
+        Request(String id, String hospital, String name, String group, String component, int qty, Double hb, Urgency urgency) {
+            super(id);
+            this.hospital = hospital; this.name = name; this.group = group; this.component = component;
+            this.qty = qty; this.hb = hb; this.urgency = urgency;
+        }
+
+        public String getHospital()  { return hospital; }
+        public String getName()      { return name; }
+        public String getGroup()     { return group; }
+        public String getComponent() { return component; }
+        public int getQty()          { return qty; }
+        public Urgency getUrgency()  { return urgency; }
+        public long getCreatedAt()   { return createdAt; }
+        public RequestStatus getStatus() { return status; }
+        public int priority()        { return urgency.getPriority(); }
+        public boolean isPending()   { return status == RequestStatus.PENDING; }
+        void markAllocated()         { status = RequestStatus.ALLOCATED; }
+        void markCompleted()         { status = RequestStatus.COMPLETED; }
+
+        @Override public String describe() {
+            return "Request " + getId() + " " + name + " needs " + group + " " + component + " x" + qty + " [" + urgency + "]";
+        }
+        @Override public String toJson() {
+            return "{\"id\":" + Json.q(getId()) + ",\"hospital\":" + Json.q(hospital) + ",\"name\":" + Json.q(name)
+                 + ",\"group\":" + Json.q(group) + ",\"component\":" + Json.q(component) + ",\"qty\":" + qty
+                 + ",\"hb\":" + (hb == null ? "null" : hb) + ",\"urgency\":" + Json.q(urgency.name())
+                 + ",\"status\":" + Json.q(status.name()) + ",\"createdAt\":" + createdAt + "}";
+        }
+    }
+
+    /* =====================================================================
+       COMPOSITION : Allocation HAS-A Request and HAS-A Unit
+       ===================================================================== */
+    static class Allocation extends BaseEntity {
+        private final Request request;
+        private final Unit unit;
+        private SafetyStatus safety = SafetyStatus.PENDING;
+        private PickupStep pickup = PickupStep.ALLOCATED;
+
+        Allocation(String id, Request request, Unit unit) { super(id); this.request = request; this.unit = unit; }
+
+        public Request getRequest()  { return request; }
+        public Unit getUnit()        { return unit; }
+        public SafetyStatus getSafety() { return safety; }
+        public PickupStep getPickup()   { return pickup; }
+
+        // the object runs its own safety rule
+        public boolean runSafetyCheck() {
+            boolean ok = Compatibility.canGive(request.getGroup(), unit.getGroup()) && unit.status() != StockStatus.EXPIRED;
+            safety = ok ? SafetyStatus.READY : SafetyStatus.LOCKED;
+            return ok;
+        }
+
+        // the object moves itself forward, only when safe
+        public PickupStep advance() {
+            if (safety != SafetyStatus.READY) throw new ApiException(409, "Awaiting safety clearance");
+            if (pickup.isLast()) throw new ApiException(409, "Already picked up");
+            pickup = pickup.next();
+            return pickup;
+        }
+
+        @Override public String describe() {
+            return "Allocation " + getId() + ": " + unit.getId() + " -> " + request.getId() + " [" + safety + ", " + pickup + "]";
+        }
+        @Override public String toJson() {
+            return "{\"patientId\":" + Json.q(request.getId()) + ",\"patientHospital\":" + Json.q(request.getHospital())
+                 + ",\"unitId\":" + Json.q(unit.getId()) + ",\"unitHospital\":" + Json.q(unit.getHospital())
+                 + ",\"unitGroup\":" + Json.q(unit.getGroup()) + ",\"patientGroup\":" + Json.q(request.getGroup())
+                 + ",\"group\":" + Json.q(request.getGroup()) + ",\"component\":" + Json.q(request.getComponent())
+                 + ",\"unitExpiry\":" + Json.q(unit.getExpiry().toString())
+                 + ",\"safety\":" + Json.q(safety.name()) + ",\"pickup\":" + Json.q(pickup.name()) + "}";
+        }
+    }
+
+    /* =====================================================================
+       INHERITANCE : PickupRecord (history entry for completed pickups)
+       ===================================================================== */
+    static class PickupRecord extends BaseEntity {
+        private final Allocation allocation; private final long at = System.currentTimeMillis();
+        PickupRecord(String id, Allocation a) { super(id); allocation = a; }
+
+        @Override public String describe() { return "Pickup of " + allocation.getUnit().getId() + " for " + allocation.getRequest().getId(); }
+        @Override public String toJson() {
+            Request r = allocation.getRequest();
+            return "{\"patientId\":" + Json.q(r.getId()) + ",\"patientHospital\":" + Json.q(r.getHospital())
+                 + ",\"unitId\":" + Json.q(allocation.getUnit().getId()) + ",\"group\":" + Json.q(r.getGroup())
+                 + ",\"component\":" + Json.q(r.getComponent()) + ",\"at\":" + at + "}";
+        }
+    }
+
+    /* =====================================================================
+       INHERITANCE : own exception type carrying an HTTP status code
+       ===================================================================== */
+    static class ApiException extends RuntimeException {
+        private final int code;
+        ApiException(int code, String msg) { super(msg); this.code = code; }
+        int getCode() { return code; }
+    }
+
+    /* =====================================================================
+       ABSTRACTION + ENCAPSULATION : BloodBank = the whole business logic.
+       Lists are private; the outside world can only use these methods.
+       ===================================================================== */
+    static class BloodBank {
+        private final List<Unit> inventory = new ArrayList<>();
+        private final List<Request> requests = new ArrayList<>();
+        private final List<Allocation> allocations = new ArrayList<>();
+        private final List<PickupRecord> pickupLog = new ArrayList<>();
+        private int nextUnit = 1, nextPatient = 101, nextAllocation = 1, nextPickup = 1;
+
+        /* ----- Inventory module ----- */
+        synchronized Unit addUnit(String hospital, String group, String component, int qty, LocalDate expiry) {
+            Unit u = new Unit(String.format("U-%03d", nextUnit++), hospital, group, component, qty, expiry);
+            inventory.add(u);
+            return u;
+        }
+        synchronized void deleteUnit(String id) {
+            if (!inventory.removeIf(u -> u.getId().equals(id))) throw new ApiException(404, "Unit not found");
+        }
+
+        /* ----- Blood Request module ----- */
+        synchronized Request addRequest(String hospital, String name, String group, String component, int qty, Double hb, Urgency urgency) {
+            Request r = new Request("P" + nextPatient++, hospital, name, group, component, qty, hb, urgency);
+            requests.add(r);
+            return r;
+        }
+        synchronized void deleteRequest(String id) {
+            Request r = findRequest(id);
+            allocations.removeIf(a -> {                           // return unpicked blood to stock
+                if (a.getRequest() == r) { if (!a.getPickup().isLast()) a.getUnit().giveBack(r.getQty()); return true; }
+                return false;
+            });
+            requests.remove(r);
+        }
+
+        /* ----- Allocation module ----- */
+        // earliest-expiring unit: same component, enough quantity, compatible group, not expired
+        private Unit findUnit(Request r) {
+            return inventory.stream()
+                .filter(u -> u.getComponent().equals(r.getComponent()) && u.getQty() >= r.getQty()
+                          && u.status() != StockStatus.EXPIRED && Compatibility.canGive(r.getGroup(), u.getGroup()))
+                .min(Comparator.comparing(Unit::getExpiry)).orElse(null);
+        }
+        synchronized Allocation allocate(String requestId) {
+            Request r = findRequest(requestId);
+            if (!r.isPending()) throw new ApiException(409, "Request is already " + r.getStatus());
+            Unit u = findUnit(r);
+            if (u == null) throw new ApiException(409, "No suitable unit available");
+            boolean blocked = requests.stream().anyMatch(o -> o != r && o.isPending()
+                && o.priority() > r.priority() && findUnit(o) == u);
+            if (blocked) throw new ApiException(409, "A more urgent request needs the same unit. Allocate that first.");
+            u.take(r.getQty());
+            r.markAllocated();
+            Allocation a = new Allocation("A-" + nextAllocation++, r, u);
+            allocations.add(a);
+            return a;
+        }
+
+        /* ----- Safety Check module ----- */
+        synchronized Allocation safetyCheck(int index) {
+            Allocation a = allocation(index);
+            a.runSafetyCheck();
+            return a;
+        }
+
+        /* ----- Pickup module ----- */
+        synchronized Allocation pickup(int index) {
+            Allocation a = allocation(index);
+            if (a.advance().isLast()) {
+                a.getRequest().markCompleted();
+                pickupLog.add(new PickupRecord("K-" + nextPickup++, a));
+            }
+            return a;
+        }
+
+        /* ----- Dashboard / Reports module ----- */
+        synchronized String stateJson() {
+            return "{\"inventory\":" + Json.array(inventory) + ",\"requests\":" + Json.array(requests)
+                 + ",\"allocations\":" + Json.array(allocations) + ",\"pickupLog\":" + Json.array(pickupLog) + "}";
+        }
+
+        private Request findRequest(String id) {
+            return requests.stream().filter(x -> x.getId().equals(id)).findFirst()
+                .orElseThrow(() -> new ApiException(404, "Request not found"));
+        }
+        private Allocation allocation(int i) {
+            if (i < 0 || i >= allocations.size()) throw new ApiException(404, "Allocation not found");
+            return allocations.get(i);
+        }
+    }
+
+    /* =====================================================================
+       LOGIN MODULE  -  CLASS & OBJECT  +  INHERITANCE
+       ---------------------------------------------------------------------
+       PARENT class : User            (what every user has and can do)
+       CHILD classes: AdminUser, HospitalUser, LabTechnicianUser
+                      (they get everything from User, and add their own role)
+       ===================================================================== */
+
+    // ---------- PARENT CLASS ----------
+    static abstract class User {
+        private final String username;          // common to all users
+        private final String password;
+
+        User(String username, String password) {
+            this.username = username;
+            this.password = password;
+        }
+
+        public String getUsername() { return username; }
+
+        // common method - written ONCE in the parent, every child can use it
+        public boolean checkLogin(String u, String p) {
+            return username.equals(u) && password.equals(p);
+        }
+
+        // each child MUST give its own answer
+        public abstract String getRole();
+        public abstract List<String> getPages();     // pages this user may open
+        public abstract String welcome();
+    }
+
+    // ---------- CHILD CLASS 1 ----------
+    static class AdminUser extends User {
+        AdminUser(String username, String password) { super(username, password); }  // send data to parent
+
+        @Override public String getRole() { return "Admin"; }
+        @Override public List<String> getPages() { return List.of("dash", "req", "inv", "alloc", "safe", "pick", "rep"); }
+        @Override public String welcome() { return "Welcome Admin - you can open every module."; }
+    }
+
+    // ---------- CHILD CLASS 2 ----------
+    static class HospitalUser extends User {
+        HospitalUser(String username, String password) { super(username, password); }
+
+        @Override public String getRole() { return "Hospital"; }
+        @Override public List<String> getPages() { return List.of("req", "inv"); }
+        @Override public String welcome() { return "Welcome Hospital - you can raise requests and manage stock."; }
+    }
+
+    // ---------- CHILD CLASS 3 ----------
+    static class LabTechnicianUser extends User {
+        LabTechnicianUser(String username, String password) { super(username, password); }
+
+        @Override public String getRole() { return "Lab Technician"; }
+        @Override public List<String> getPages() { return List.of("dash", "inv", "safe", "pick", "rep"); }
+        @Override public String welcome() { return "Welcome Lab Technician - you handle safety checks and pickups."; }
+    }
+
+    // ---------- uses the OBJECTS ----------
+    static class AuthService {
+        private final List<User> users = new ArrayList<>();
+
+        AuthService() {
+            users.add(new AdminUser("admin", "admin123"));
